@@ -186,7 +186,7 @@ class TaxonAutocompleter:
         self.connection.row_factory = sqlite3.Row
         self.limit = limit
 
-    def search(self, q: str, language: str = 'en', deduplicate: bool = False) -> list[Taxon]:
+    def search(self, q: str, language: str = 'en', deduplicate: bool = False, rank: str = None) -> list[Taxon]:
         """Search for taxa by scientific and/or common name.
 
         Args:
@@ -223,6 +223,9 @@ class TaxonAutocompleter:
         if language:
             query += 'AND (language_code IS NULL OR language_code = ?) '
             params += [language.lower().replace('-', '_')]
+        if rank:
+            query += 'AND (taxon_rank = ?) '
+            params += [rank.lower()]
 
         if deduplicate:
             query += """
