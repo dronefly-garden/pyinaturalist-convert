@@ -172,6 +172,14 @@ class TextField(Enum):
     IDENTIFICATION = 3
     PLACE = 4
 
+# Named scoring constants for TaxonAutocompleter
+EXACT_MATCH_BOOST = -100.0
+LOCALE_PREFIX_BOOST = -20.0
+SCIENTIFIC_PREFIX_BOOST = -20.0
+GENERAL_PREFIX_BOOST = -10.0
+LENGTH_PENALTY_FACTOR = 0.2
+POPULARITY_RANK_FACTOR = -10.0
+
 
 class TaxonAutocompleter:
     """Taxon autocomplete search. Runs full text search on taxon scientific and common names.
@@ -179,6 +187,7 @@ class TaxonAutocompleter:
     Args:
         db_path: Path to SQLite database; uses platform-specific data directory by default
         limit: Maximum number of results to return per query. Set to -1 to disable.
+        taxon_rank: Optionally filter by this taxon rank.
     """
 
     def __init__(self, db_path: PathOrStr = DB_PATH, limit: int = 10):
@@ -186,66 +195,110 @@ class TaxonAutocompleter:
         self.connection.row_factory = sqlite3.Row
         self.limit = limit
 
-    def search(self, q: str, language: str = 'en', deduplicate: bool = False, rank: str = None) -> list[Taxon]:
-        """Search for taxa by scientific and/or common name.
-
-        Args:
-            q: Search query
-            language: Language code for common names
-            deduplicate: return only the first name per matched taxon id
-
-        Returns:
-            Taxon objects (with ID and name only)
-        """
-        q = _sanitize_fts_query(q)
-        if not q:
+    def search(
+        self,
+        q: str,
+        language: str = 'en',
+        taxon_rank: str | None = None,
+    ) -> list[Taxon]:
+        """Search for taxa by scientific and/or common name."""
+        clean_q = _sanitize_fts_query(q)
+        if not clean_q:
             return []
 
-        if deduplicate:
-            query = f"""
-                WITH ranked_matches AS (
-                    SELECT *,
-                        rank,
-                        (rank - COALESCE(count_rank, -1)) AS combined_rank,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY taxon_id
-                            ORDER BY (rank - COALESCE(count_rank, -1)) ASC
-                        ) AS rn
-                    FROM {TAXON_FTS_TABLE}
-                    WHERE name MATCH ? || '*'
-"""
-        else:
-            query = f'SELECT *, rank, (rank - COALESCE(count_rank, -1)) AS combined_rank FROM {TAXON_FTS_TABLE} '
-            query += "WHERE name MATCH ? || '*' "
+        fts_q = f'{clean_q}*'
+        q_lower = clean_q.lower()
+        lang_code = language.lower().replace('-', '_')[:2] if language else 'en'
 
-        params: ParamList = [q]
+        where_clauses = [
+            "name MATCH ?",
+            "(language_code IS NULL OR LOWER(language_code) LIKE ? || '%')",
+        ]
 
-        if language:
-            query += 'AND (language_code IS NULL OR language_code = ?) '
-            params += [language.lower().replace('-', '_')]
-        if rank:
-            query += 'AND (taxon_rank = ?) '
-            params += [rank.lower()]
+        params: ParamList = [
+            q_lower,    # 1. Exact string match
+            q_lower,    # 2. Locale prefix match (name)
+            lang_code,  # 3. Locale prefix match (language_code)
+            q_lower,    # 4. Scientific prefix match (name)
+            q_lower,    # 5. General prefix match (name)
+            fts_q,      # 6. FTS MATCH query
+            lang_code,  # 7. Language code filter
+        ]
 
-        if deduplicate:
-            query += """
-                )
-                SELECT * FROM ranked_matches
-                WHERE rn = 1
-"""
+        if taxon_rank:
+            where_clauses.append("taxon_rank = ?")
+            params.append(taxon_rank.lower())
 
-        if self.limit > 1:
-            query += 'ORDER BY combined_rank LIMIT ?'
-            params += [self.limit]
+        where_sql = " AND ".join(where_clauses)
+
+        query = f"""
+            WITH scored AS (
+                SELECT 
+                    taxon_id,
+                    name,
+                    taxon_rank,
+                    count_rank,
+                    language_code,
+                    (
+                        -- 1. Exact string match (highest priority, matches TaxaController.exact)
+                        (CASE WHEN LOWER(name) = ? THEN {EXACT_MATCH_BOOST} ELSE 0.0 END)
+
+                        -- 2. Vernacular name prefix match in requested locale
+                        + (CASE WHEN LOWER(name) LIKE ? || '%' AND (language_code IS NOT NULL AND LOWER(language_code) LIKE ? || '%') THEN {LOCALE_PREFIX_BOOST} ELSE 0.0 END)
+
+                        -- 3. Scientific name prefix match (language_code IS NULL)
+                        + (CASE WHEN LOWER(name) LIKE ? || '%' AND language_code IS NULL THEN {SCIENTIFIC_PREFIX_BOOST} ELSE 0.0 END)
+
+                        -- 4. General prefix match
+                        + (CASE WHEN LOWER(name) LIKE ? || '%' THEN {GENERAL_PREFIX_BOOST} ELSE 0.0 END)
+
+                        -- 5. Length penalty to prioritize concise matches ("buttercups" over multi-word strings)
+                        + (LENGTH(name) * {LENGTH_PENALTY_FACTOR})
+
+                        -- 6. Log-scaled cumulative observation popularity
+                        + (COALESCE(count_rank, 0.0) * {POPULARITY_RANK_FACTOR})
+
+                        -- 7. FTS BM25 tie-breaker
+                        + `rank`
+                    ) AS item_score
+                FROM {TAXON_FTS_TABLE}
+                WHERE {where_sql}
+            ),
+            ranked AS (
+                SELECT 
+                    taxon_id,
+                    name,
+                    taxon_rank,
+                    item_score,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY taxon_id 
+                        ORDER BY item_score ASC
+                    ) AS rn
+                FROM scored
+            )
+            SELECT 
+                taxon_id,
+                name,
+                taxon_rank,
+                item_score AS best_score
+            FROM ranked
+            WHERE rn = 1
+            ORDER BY best_score ASC
+        """
+
+        if self.limit > 0:
+            query += " LIMIT ?"
+            params.append(self.limit)
 
         with self.connection as conn:
             cursor = conn.execute(query, params)
-            results = sorted(
-                cursor.fetchall(),
-                key=lambda row: row['combined_rank'],
-            )
+            results = cursor.fetchall()
             return [
-                Taxon(id=int(row['taxon_id']), name=row['name'], rank=row['taxon_rank'])
+                Taxon(
+                    id=int(row['taxon_id']),
+                    name=row['name'],
+                    rank=row['taxon_rank'],
+                )
                 for row in results
             ]
 
@@ -609,10 +662,11 @@ def _add_taxon_counts(row: list, field_index: dict[str, int], taxon_counts: dict
         row[lang_idx] = str(row[lang_idx]).lower().replace('-', '_')
     return row
 
-
 # TODO: Read from taxon table instead
-def _normalize_taxon_counts(agg_path: PathOrStr = TAXON_AGGREGATES_PATH) -> dict[int, int]:
-    """Read previously calculated taxon counts, and normalize to a logarithmic distribution"""
+def _normalize_taxon_counts(
+    agg_path: PathOrStr = TAXON_AGGREGATES_PATH,
+) -> dict[int, float]:
+    """Read previously calculated taxon counts and apply log1p scaling to match iNat ES scoring."""
     import numpy as np
     import pandas as pd
 
@@ -623,19 +677,10 @@ def _normalize_taxon_counts(agg_path: PathOrStr = TAXON_AGGREGATES_PATH) -> dict
     logger.info(f'Reading taxon counts from {agg_path}')
     df = pd.read_parquet(agg_path)
 
-    def normalize(series):
-        with np.errstate(divide='ignore'):
-            series = np.log(series.copy())
-        series[np.isneginf(series)] = 0
-        return (series - series.mean()) / series.std()
-
     logger.info('Normalizing taxon counts')
-    df['count_rank'] = normalize(df['observations_count_rg']).fillna(-1)
-    df['count_rank'] = df['count_rank'] * TAXON_COUNT_RANK_FACTOR
-    df = df.sort_values(by='count_rank', ascending=False)
-    result_dict = df['count_rank'].to_dict()
-    return dict(sorted(result_dict.items()))
-
+    counts = df['observations_count_rg'].fillna(0).to_numpy()
+    df['count_rank'] = np.log1p(counts) * TAXON_COUNT_RANK_FACTOR
+    return df.set_index('id')['count_rank'].to_dict()
 
 def _load_taxon_ranks(db_path: PathOrStr = DB_PATH):
     """Set taxon ranks for common name results. Attempt to get from full taxa table, which
