@@ -67,3 +67,6 @@ docs/sample_data
 .vscode/
 swagger.json
 dev_*.py
+
+# uv
+.python-version
