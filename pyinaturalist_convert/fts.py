@@ -182,9 +182,18 @@ class TaxonAutocompleter:
     """
 
     def __init__(self, db_path: PathOrStr = DB_PATH, limit: int = 10):
-        self.connection = sqlite3.connect(db_path)
-        self.connection.row_factory = sqlite3.Row
+        self.db_path = db_path
         self.limit = limit
+        self._conn = None
+
+    @property
+    def connection(self):
+        # - Fails fast if autocompleter is used when the DB is locked
+        if self._conn is None:
+            self._conn = sqlite3.connect(f"file:{self.db_path}?mode=ro", uri=True, timeout=0.5)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA busy_timeout = 500;")
+        return self._conn
 
     def search(self, q: str, language: str = 'en') -> list[Taxon]:
         """Search for taxa by scientific and/or common name.
@@ -211,16 +220,29 @@ class TaxonAutocompleter:
             query += 'ORDER BY combined_rank LIMIT ?'
             params += [self.limit]
 
-        with self.connection as conn:
-            cursor = conn.execute(query, params)
-            results = sorted(
-                cursor.fetchall(),
-                key=lambda row: row['combined_rank'],
-            )
-            return [
-                Taxon(id=int(row['taxon_id']), name=row['name'], rank=row['taxon_rank'])
-                for row in results
-            ]
+        try:
+            with self.connection as conn:
+                conn.execute('PRAGMA busy_timeout = 500')
+                cursor = conn.execute(query, params)
+                results = sorted(
+                    cursor.fetchall(),
+                    key=lambda row: row['combined_rank'],
+                )
+                return [
+                    Taxon(id=int(row['taxon_id']), name=row['name'], rank=row['taxon_rank'])
+                    for row in results
+                ]
+        except (sqlite3.OperationalError, sqlite3.InterfaceError, sqlite3.DatabaseError) as err:
+            if self._conn:
+                try:
+                    self._conn.close()
+                except Exception:
+                    pass
+            # Dispose of the failed connection to trigger another attempt
+            # to create it later.
+            self._conn = None
+            raise err
+
 
 
 # TODO: Add observation short description (what/where/when) to FTS table?
