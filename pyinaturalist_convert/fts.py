@@ -200,13 +200,17 @@ class TaxonAutocompleter:
         q: str,
         language: str = 'en',
         taxon_rank: str | None = None,
+        prefix_all: bool = False,
     ) -> list[Taxon]:
         """Search for taxa by scientific and/or common name."""
         clean_q = _sanitize_fts_query(q)
         if not clean_q:
             return []
 
-        fts_q = f'{clean_q}*'
+        if prefix_all:
+            fts_q = f'{"* ".join(clean_q.split())}*'
+        else:
+            fts_q = f'{clean_q}*'
         q_lower = clean_q.lower()
         lang_code = language.lower().replace('-', '_')[:2] if language else 'en'
 
