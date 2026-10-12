@@ -212,22 +212,35 @@ class TaxonAutocompleter:
         else:
             fts_q = f'{clean_q}*'
         q_lower = clean_q.lower()
-        lang_code = language.lower().replace('-', '_')[:2] if language else 'en'
+        lang_code = language.lower().replace('-', '_')[:2] if language else None
 
-        where_clauses = [
-            "name MATCH ?",
-            "(language_code IS NULL OR LOWER(language_code) LIKE ? || '%')",
-        ]
+        params = []
 
-        params: ParamList = [
-            q_lower,    # 1. Exact string match
-            q_lower,    # 2. Locale prefix match (name)
-            lang_code,  # 3. Locale prefix match (language_code)
-            q_lower,    # 4. Scientific prefix match (name)
-            q_lower,    # 5. General prefix match (name)
-            fts_q,      # 6. FTS MATCH query
-            lang_code,  # 7. Language code filter
-        ]
+        # 1. Exact string match parameter
+        params.append(q_lower)
+
+        # 2 & 3. Vernacular name prefix match configuration
+        locale_case_sql = "LOWER(name) LIKE ? || '%'"
+        params.append(q_lower)
+        if lang_code:
+            locale_case_sql += " AND language_code IS NOT NULL AND LOWER(language_code) LIKE ? || '%'"
+            params.append(lang_code)
+        else:
+            locale_case_sql += " AND language_code IS NOT NULL"
+
+        # 4. Scientific name prefix match parameter
+        params.append(q_lower)
+
+        # 5. General prefix match parameter
+        params.append(q_lower)
+
+        # Build WHERE clause dynamically
+        where_clauses = ["name MATCH ?"]
+        params.append(fts_q)
+
+        if lang_code:
+            where_clauses.append("(language_code IS NULL OR LOWER(language_code) LIKE ? || '%')")
+            params.append(lang_code)
 
         if taxon_rank:
             where_clauses.append("taxon_rank = ?")
@@ -244,25 +257,12 @@ class TaxonAutocompleter:
                     count_rank,
                     language_code,
                     (
-                        -- 1. Exact string match (highest priority, matches TaxaController.exact)
                         (CASE WHEN LOWER(name) = ? THEN {EXACT_MATCH_BOOST} ELSE 0.0 END)
-
-                        -- 2. Vernacular name prefix match in requested locale
-                        + (CASE WHEN LOWER(name) LIKE ? || '%' AND (language_code IS NOT NULL AND LOWER(language_code) LIKE ? || '%') THEN {LOCALE_PREFIX_BOOST} ELSE 0.0 END)
-
-                        -- 3. Scientific name prefix match (language_code IS NULL)
+                        + (CASE WHEN {locale_case_sql} THEN {LOCALE_PREFIX_BOOST} ELSE 0.0 END)
                         + (CASE WHEN LOWER(name) LIKE ? || '%' AND language_code IS NULL THEN {SCIENTIFIC_PREFIX_BOOST} ELSE 0.0 END)
-
-                        -- 4. General prefix match
                         + (CASE WHEN LOWER(name) LIKE ? || '%' THEN {GENERAL_PREFIX_BOOST} ELSE 0.0 END)
-
-                        -- 5. Length penalty to prioritize concise matches ("buttercups" over multi-word strings)
                         + (LENGTH(name) * {LENGTH_PENALTY_FACTOR})
-
-                        -- 6. Log-scaled cumulative observation popularity
                         + (COALESCE(count_rank, 0.0) * {POPULARITY_RANK_FACTOR})
-
-                        -- 7. FTS BM25 tie-breaker
                         + `rank`
                     ) AS item_score
                 FROM {TAXON_FTS_TABLE}
