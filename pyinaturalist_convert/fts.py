@@ -120,7 +120,7 @@ from functools import partial
 from itertools import chain
 from logging import Logger, getLogger
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import Any, TYPE_CHECKING, Optional
 
 from pyinaturalist import Observation
 from pyinaturalist.models import Taxon
@@ -173,9 +173,10 @@ class TextField(Enum):
     PLACE = 4
 
 # Named scoring constants for TaxonAutocompleter
-EXACT_MATCH_BOOST = -100.0
-LOCALE_PREFIX_BOOST = -20.0
-SCIENTIFIC_PREFIX_BOOST = -20.0
+EXACT_MATCH_BOOST = -200.0
+PHRASE_MATCH_BOOST = -150.0  # Increased to let multi-word phrase matches beat raw popularity
+LOCALE_PREFIX_BOOST = -30.0
+SCIENTIFIC_PREFIX_BOOST = -30.0
 GENERAL_PREFIX_BOOST = -10.0
 LENGTH_PENALTY_FACTOR = 0.2
 POPULARITY_RANK_FACTOR = -10.0
@@ -187,7 +188,6 @@ class TaxonAutocompleter:
     Args:
         db_path: Path to SQLite database; uses platform-specific data directory by default
         limit: Maximum number of results to return per query. Set to -1 to disable.
-        taxon_rank: Optionally filter by this taxon rank.
     """
 
     def __init__(self, db_path: PathOrStr = DB_PATH, limit: int = 10):
@@ -200,33 +200,62 @@ class TaxonAutocompleter:
         q: str,
         language: str = 'en',
         taxon_rank: str | None = None,
-        prefix_all: bool = False,
     ) -> list[Taxon]:
         """Search for taxa by scientific and/or common name."""
         clean_q = _sanitize_fts_query(q)
         if not clean_q:
             return []
 
-        if prefix_all:
-            fts_q = f'{"* ".join(clean_q.split())}*'
-        else:
-            fts_q = f'{clean_q}*'
+        tokens = clean_q.split()
+        fts_q = f'{"* ".join(tokens)}*'
         q_lower = clean_q.lower()
         lang_code = language.lower().replace('-', '_')[:2] if language else None
 
-        params = []
+        params: list[Any] = []
 
-        # 1. Exact string match parameter
+        # 1. Exact match parameter
         params.append(q_lower)
 
-        # 2 & 3. Vernacular name prefix match configuration
-        locale_case_sql = "LOWER(name) LIKE ? || '%'"
-        params.append(q_lower)
+        # 2. Strict word-boundary phrase match parameters
+        phrase_parts = [
+            "(REPLACE(LOWER(name), '-', ' ') LIKE ? || ' ' || '%' OR "
+            "REPLACE(LOWER(name), '-', ' ') LIKE ? || '-%' OR "
+            "REPLACE(LOWER(name), '-', ' ') = ?)"
+        ]
+        phrase_params = [tokens[0], tokens[0], tokens[0]]
+        for token in tokens[1:]:
+            phrase_parts.append(
+                "(REPLACE(LOWER(name), '-', ' ') LIKE '% ' || ? || ' ' || '%' OR "
+                "REPLACE(LOWER(name), '-', ' ') LIKE '% ' || ? || '-%')"
+            )
+            phrase_params.extend([token, token])
+
+        phrase_match_sql = " AND ".join(phrase_parts)
+        params.extend(phrase_params)
         if lang_code:
-            locale_case_sql += " AND language_code IS NOT NULL AND LOWER(language_code) LIKE ? || '%'"
+            phrase_match_sql += " AND language_code IS NOT NULL AND LOWER(language_code) LIKE ? || '%'"
             params.append(lang_code)
         else:
-            locale_case_sql += " AND language_code IS NOT NULL"
+            phrase_match_sql += " AND language_code IS NOT NULL"
+
+        # 3. Loose prefix match parameters (for partial word fragments)
+        loose_parts = ["REPLACE(LOWER(name), '-', ' ') LIKE ? || '%'"]
+        loose_params = [tokens[0]]
+        for token in tokens[1:]:
+            loose_parts.append(
+                "(REPLACE(LOWER(name), '-', ' ') LIKE '% ' || ? || '%' OR "
+                "REPLACE(LOWER(name), '-', ' ') LIKE '%-' || ? || '%')"
+            )
+            # FIX: Both placeholders in this clause require the token parameter
+            loose_params.extend([token, token])
+
+        loose_match_sql = " AND ".join(loose_parts)
+        params.extend(loose_params)
+        if lang_code:
+            loose_match_sql += " AND language_code IS NOT NULL AND LOWER(language_code) LIKE ? || '%'"
+            params.append(lang_code)
+        else:
+            loose_match_sql += " AND language_code IS NOT NULL"
 
         # 4. Scientific name prefix match parameter
         params.append(q_lower)
@@ -257,10 +286,11 @@ class TaxonAutocompleter:
                     count_rank,
                     language_code,
                     (
-                        (CASE WHEN LOWER(name) = ? THEN {EXACT_MATCH_BOOST} ELSE 0.0 END)
-                        + (CASE WHEN {locale_case_sql} THEN {LOCALE_PREFIX_BOOST} ELSE 0.0 END)
-                        + (CASE WHEN LOWER(name) LIKE ? || '%' AND language_code IS NULL THEN {SCIENTIFIC_PREFIX_BOOST} ELSE 0.0 END)
-                        + (CASE WHEN LOWER(name) LIKE ? || '%' THEN {GENERAL_PREFIX_BOOST} ELSE 0.0 END)
+                        (CASE WHEN REPLACE(LOWER(name), '-', ' ') = ? THEN {EXACT_MATCH_BOOST} ELSE 0.0 END)
+                        + (CASE WHEN {phrase_match_sql} THEN {PHRASE_MATCH_BOOST} ELSE 0.0 END)
+                        + (CASE WHEN {loose_match_sql} THEN {LOCALE_PREFIX_BOOST} ELSE 0.0 END)
+                        + (CASE WHEN REPLACE(LOWER(name), '-', ' ') LIKE ? || '%' AND language_code IS NULL THEN {SCIENTIFIC_PREFIX_BOOST} ELSE 0.0 END)
+                        + (CASE WHEN REPLACE(LOWER(name), '-', ' ') LIKE ? || '%' THEN {GENERAL_PREFIX_BOOST} ELSE 0.0 END)
                         + (LENGTH(name) * {LENGTH_PENALTY_FACTOR})
                         + (COALESCE(count_rank, 0.0) * {POPULARITY_RANK_FACTOR})
                         + `rank`
@@ -305,7 +335,6 @@ class TaxonAutocompleter:
                 )
                 for row in results
             ]
-
 
 # TODO: Add observation short description (what/where/when) to FTS table?
 # TODO: Add iconic taxon ID to display emoji in search results?
