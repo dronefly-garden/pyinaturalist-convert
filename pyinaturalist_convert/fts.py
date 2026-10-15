@@ -115,6 +115,7 @@ Search observations::
 import re
 import sqlite3
 from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 from enum import Enum
 from functools import partial
 from itertools import chain
@@ -174,13 +175,58 @@ class TextField(Enum):
 
 # Named scoring constants for TaxonAutocompleter
 EXACT_MATCH_BOOST = -200.0
-PHRASE_MATCH_BOOST = -150.0  # Increased to let multi-word phrase matches beat raw popularity
-LOCALE_PREFIX_BOOST = -30.0
+PHRASE_MATCH_BOOST = -10.0
+LOCALE_PREFIX_BOOST = -40.0
 SCIENTIFIC_PREFIX_BOOST = -30.0
-GENERAL_PREFIX_BOOST = -10.0
+GENERAL_PREFIX_BOOST = -100.0
 LENGTH_PENALTY_FACTOR = 0.2
+ENGLISH_LANG_BOOST = -140.0
 POPULARITY_RANK_FACTOR = -10.0
 
+@dataclass
+class TaxonScoringStrategy:
+    exact_match_boost: float = -200.0
+    phrase_match_boost: float = -10.0
+    locale_prefix_boost: float = -40.0
+    scientific_prefix_boost: float = -30.0
+    general_prefix_boost: float = -100.0
+    length_penalty_factor: float = 0.2
+    english_lang_boost: float = -140.0
+    popularity_rank_factor: float = -10.0
+
+    def build_scoring_sql(
+        self,
+        q_lower: str,
+        phrase_match_sql: str,
+        loose_match_sql: str,
+        preferred_lang: str,
+    ) -> tuple[str, list[Any]]:
+        """Generates the SQL score expression and collects the required parameter bindings."""
+        sql = f"""
+            (
+                (CASE WHEN REPLACE(LOWER(fts.name), '-', ' ') = ? THEN {self.exact_match_boost} ELSE 0.0 END)
+                + (CASE WHEN {phrase_match_sql} THEN {self.phrase_match_boost} ELSE 0.0 END)
+                + (CASE WHEN {loose_match_sql} THEN {self.locale_prefix_boost} ELSE 0.0 END)
+                + (CASE WHEN REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || '%' AND fts.language_code IS NULL THEN {self.scientific_prefix_boost} ELSE 0.0 END)
+                + (CASE WHEN REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || '%' THEN {self.general_prefix_boost} ELSE 0.0 END)
+                + (CASE WHEN fts.language_code LIKE ? THEN {self.english_lang_boost} ELSE 0.0 END)
+                + (LENGTH(fts.name) * {self.length_penalty_factor})
+                + (COALESCE(fts.count_rank, 0.0) * {self.popularity_rank_factor})
+                + fts.`rank`
+            )
+        """
+        # Parameters consumed specifically by this scoring block:
+        # 1. Exact match query
+        # 2. Scientific prefix query
+        # 3. General prefix query
+        # 4. Preferred language pattern
+        params = [
+            q_lower,
+            q_lower,
+            q_lower,
+            f"{preferred_lang}%",
+        ]
+        return sql, params
 
 class TaxonAutocompleter:
     """Taxon autocomplete search. Runs full text search on taxon scientific and common names.
@@ -200,8 +246,12 @@ class TaxonAutocompleter:
         q: str,
         language: str = 'en',
         taxon_rank: str | None = None,
+        taxon_id: int | None = None,
+        strategy: TaxonScoringStrategy | None = None,
     ) -> list[Taxon]:
-        """Search for taxa by scientific and/or common name."""
+        if strategy is None:
+            strategy = TaxonScoringStrategy()
+
         clean_q = _sanitize_fts_query(q)
         if not clean_q:
             return []
@@ -209,93 +259,82 @@ class TaxonAutocompleter:
         tokens = clean_q.split()
         fts_q = f'{"* ".join(tokens)}*'
         q_lower = clean_q.lower()
-        lang_code = language.lower().replace('-', '_')[:2] if language else None
+        preferred_lang = language.lower().replace('-', '_')[:2] if language else 'en'
 
         params: list[Any] = []
 
-        # 1. Exact match parameter
-        params.append(q_lower)
-
-        # 2. Strict word-boundary phrase match parameters
+        # 1. Phrase match parameters (added to params first)
         phrase_parts = [
-            "(REPLACE(LOWER(name), '-', ' ') LIKE ? || ' ' || '%' OR "
-            "REPLACE(LOWER(name), '-', ' ') LIKE ? || '-%' OR "
-            "REPLACE(LOWER(name), '-', ' ') = ?)"
+            "(REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || ' ' || '%' OR "
+            "REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || '-%' OR "
+            "REPLACE(LOWER(fts.name), '-', ' ') = ?)"
         ]
         phrase_params = [tokens[0], tokens[0], tokens[0]]
         for token in tokens[1:]:
             phrase_parts.append(
-                "(REPLACE(LOWER(name), '-', ' ') LIKE '% ' || ? || ' ' || '%' OR "
-                "REPLACE(LOWER(name), '-', ' ') LIKE '% ' || ? || '-%')"
+                "(REPLACE(LOWER(fts.name), '-', ' ') LIKE '% ' || ? || ' ' || '%' OR "
+                "REPLACE(LOWER(fts.name), '-', ' ') LIKE '% ' || ? || '-%')"
             )
             phrase_params.extend([token, token])
 
         phrase_match_sql = " AND ".join(phrase_parts)
         params.extend(phrase_params)
-        if lang_code:
-            phrase_match_sql += " AND language_code IS NOT NULL AND LOWER(language_code) LIKE ? || '%'"
-            params.append(lang_code)
-        else:
-            phrase_match_sql += " AND language_code IS NOT NULL"
+        phrase_match_sql += " AND fts.language_code IS NOT NULL"
 
-        # 3. Loose prefix match parameters (for partial word fragments)
-        loose_parts = ["REPLACE(LOWER(name), '-', ' ') LIKE ? || '%'"]
+        # 2. Loose prefix match parameters (added to params second)
+        loose_parts = ["REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || '%'"]
         loose_params = [tokens[0]]
         for token in tokens[1:]:
             loose_parts.append(
-                "(REPLACE(LOWER(name), '-', ' ') LIKE '% ' || ? || '%' OR "
-                "REPLACE(LOWER(name), '-', ' ') LIKE '%-' || ? || '%')"
+                "(REPLACE(LOWER(fts.name), '-', ' ') LIKE '% ' || ? || '%' OR "
+                "REPLACE(LOWER(fts.name), '-', ' ') LIKE '%-' || ? || '%')"
             )
-            # FIX: Both placeholders in this clause require the token parameter
             loose_params.extend([token, token])
 
         loose_match_sql = " AND ".join(loose_parts)
         params.extend(loose_params)
-        if lang_code:
-            loose_match_sql += " AND language_code IS NOT NULL AND LOWER(language_code) LIKE ? || '%'"
-            params.append(lang_code)
-        else:
-            loose_match_sql += " AND language_code IS NOT NULL"
+        loose_match_sql += " AND fts.language_code IS NOT NULL"
 
-        # 4. Scientific name prefix match parameter
-        params.append(q_lower)
+        # 3. Get scoring SQL and its corresponding parameters from the strategy object
+        score_sql, strategy_params = strategy.build_scoring_sql(
+            q_lower=q_lower,
+            phrase_match_sql=phrase_match_sql,
+            loose_match_sql=loose_match_sql,
+            preferred_lang=preferred_lang,
+        )
+        params.extend(strategy_params)
 
-        # 5. General prefix match parameter
-        params.append(q_lower)
-
-        # Build WHERE clause dynamically
-        where_clauses = ["name MATCH ?"]
+        # 4. WHERE & JOIN clauses
+        where_clauses = ["fts.name MATCH ?"]
         params.append(fts_q)
 
-        if lang_code:
-            where_clauses.append("(language_code IS NULL OR LOWER(language_code) LIKE ? || '%')")
-            params.append(lang_code)
-
         if taxon_rank:
-            where_clauses.append("taxon_rank = ?")
+            where_clauses.append("fts.taxon_rank = ?")
             params.append(taxon_rank.lower())
+
+        join_sql = ""
+        if taxon_id is not None:
+            join_sql = f"JOIN taxon t ON fts.taxon_id = t.id"
+            where_clauses.append(
+                "(t.id = ? OR t.ancestor_ids = ? OR t.ancestor_ids LIKE ? || ',%' "
+                "OR t.ancestor_ids LIKE '%,' || ? OR t.ancestor_ids LIKE '%,' || ? || ',%')"
+            )
+            str_ancestor_id = str(taxon_id)
+            params.extend([taxon_id, str_ancestor_id, str_ancestor_id, str_ancestor_id, str_ancestor_id])
 
         where_sql = " AND ".join(where_clauses)
 
         query = f"""
             WITH scored AS (
                 SELECT 
-                    taxon_id,
-                    name,
-                    taxon_rank,
-                    count_rank,
-                    language_code,
-                    (
-                        (CASE WHEN REPLACE(LOWER(name), '-', ' ') = ? THEN {EXACT_MATCH_BOOST} ELSE 0.0 END)
-                        + (CASE WHEN {phrase_match_sql} THEN {PHRASE_MATCH_BOOST} ELSE 0.0 END)
-                        + (CASE WHEN {loose_match_sql} THEN {LOCALE_PREFIX_BOOST} ELSE 0.0 END)
-                        + (CASE WHEN REPLACE(LOWER(name), '-', ' ') LIKE ? || '%' AND language_code IS NULL THEN {SCIENTIFIC_PREFIX_BOOST} ELSE 0.0 END)
-                        + (CASE WHEN REPLACE(LOWER(name), '-', ' ') LIKE ? || '%' THEN {GENERAL_PREFIX_BOOST} ELSE 0.0 END)
-                        + (LENGTH(name) * {LENGTH_PENALTY_FACTOR})
-                        + (COALESCE(count_rank, 0.0) * {POPULARITY_RANK_FACTOR})
-                        + `rank`
-                    ) AS item_score
-                FROM {TAXON_FTS_TABLE}
+                    fts.taxon_id,
+                    fts.name,
+                    fts.taxon_rank,
+                    fts.count_rank,
+                    fts.language_code,
+                    {score_sql} AS item_score
+                FROM {TAXON_FTS_TABLE} fts
+                {join_sql}
                 WHERE {where_sql}
             ),
             ranked AS (
