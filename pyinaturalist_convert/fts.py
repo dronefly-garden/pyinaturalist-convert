@@ -185,14 +185,14 @@ POPULARITY_RANK_FACTOR = -10.0
 
 @dataclass
 class TaxonScoringStrategy:
-    exact_match_boost: float = -200.0
-    phrase_match_boost: float = -10.0
-    locale_prefix_boost: float = -40.0
-    scientific_prefix_boost: float = -30.0
-    general_prefix_boost: float = -100.0
-    length_penalty_factor: float = 0.2
-    english_lang_boost: float = -140.0
-    popularity_rank_factor: float = -10.0
+    exact_match_boost: float = EXACT_MATCH_BOOST
+    phrase_match_boost: float = PHRASE_MATCH_BOOST
+    locale_prefix_boost: float = LOCALE_PREFIX_BOOST
+    scientific_prefix_boost: float = SCIENTIFIC_PREFIX_BOOST
+    general_prefix_boost: float = GENERAL_PREFIX_BOOST
+    length_penalty_factor: float = LENGTH_PENALTY_FACTOR
+    english_lang_boost: float = ENGLISH_LANG_BOOST
+    popularity_rank_factor: float = POPULARITY_RANK_FACTOR
 
     def build_scoring_sql(
         self,
@@ -201,7 +201,6 @@ class TaxonScoringStrategy:
         loose_match_sql: str,
         preferred_lang: str,
     ) -> tuple[str, list[Any]]:
-        """Generates the SQL score expression and collects the required parameter bindings."""
         sql = f"""
             (
                 (CASE WHEN REPLACE(LOWER(fts.name), '-', ' ') = ? THEN {self.exact_match_boost} ELSE 0.0 END)
@@ -215,11 +214,6 @@ class TaxonScoringStrategy:
                 + fts.`rank`
             )
         """
-        # Parameters consumed specifically by this scoring block:
-        # 1. Exact match query
-        # 2. Scientific prefix query
-        # 3. General prefix query
-        # 4. Preferred language pattern
         params = [
             q_lower,
             q_lower,
@@ -278,7 +272,6 @@ class TaxonAutocompleter:
             phrase_params.extend([token, token])
 
         phrase_match_sql = " AND ".join(phrase_parts)
-        params.extend(phrase_params)
         phrase_match_sql += " AND fts.language_code IS NOT NULL"
 
         # 2. Loose prefix match parameters (added to params second)
@@ -292,7 +285,6 @@ class TaxonAutocompleter:
             loose_params.extend([token, token])
 
         loose_match_sql = " AND ".join(loose_parts)
-        params.extend(loose_params)
         loose_match_sql += " AND fts.language_code IS NOT NULL"
 
         # 3. Get scoring SQL and its corresponding parameters from the strategy object
@@ -303,6 +295,8 @@ class TaxonAutocompleter:
             preferred_lang=preferred_lang,
         )
         params.extend(strategy_params)
+        params.extend(phrase_params)
+        params.extend(loose_params)
 
         # 4. WHERE & JOIN clauses
         where_clauses = ["fts.name MATCH ?"]
@@ -366,6 +360,9 @@ class TaxonAutocompleter:
         with self.connection as conn:
             cursor = conn.execute(query, params)
             results = cursor.fetchall()
+            for row in results:
+                if int(row['taxon_id']) == 1106273:
+                    print(f"[DEBUG FOUND] Taxon 1106273 score: {row['best_score']} | name: {row['name']}")
             return [
                 Taxon(
                     id=int(row['taxon_id']),
