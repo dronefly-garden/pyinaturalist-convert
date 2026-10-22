@@ -360,9 +360,6 @@ class TaxonAutocompleter:
         with self.connection as conn:
             cursor = conn.execute(query, params)
             results = cursor.fetchall()
-            for row in results:
-                if int(row['taxon_id']) == 1106273:
-                    print(f"[DEBUG FOUND] Taxon 1106273 score: {row['best_score']} | name: {row['name']}")
             return [
                 Taxon(
                     id=int(row['taxon_id']),
