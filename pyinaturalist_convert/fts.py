@@ -122,6 +122,7 @@ from itertools import chain
 from logging import Logger, getLogger
 from pathlib import Path
 from typing import Any, TYPE_CHECKING, Optional
+import unicodedata
 
 from pyinaturalist import Observation
 from pyinaturalist.models import Taxon
@@ -183,6 +184,14 @@ LENGTH_PENALTY_FACTOR = 0.2
 ENGLISH_LANG_BOOST = -140.0
 POPULARITY_RANK_FACTOR = -10.0
 
+def strip_diacritics(text: str) -> str:
+    if not text:
+        return ""
+    return ''.join(
+        c for c in unicodedata.normalize('NFD', text)
+        if unicodedata.category(c) != 'Mn'
+    )
+
 @dataclass
 class TaxonScoringStrategy:
     exact_match_boost: float = EXACT_MATCH_BOOST
@@ -201,13 +210,14 @@ class TaxonScoringStrategy:
         loose_match_sql: str,
         preferred_lang: str,
     ) -> tuple[str, list[Any]]:
+        fts_name = "REPLACE(LOWER(strip_diacritics(fts.name)), '-', ' ')"
         sql = f"""
             (
-                (CASE WHEN REPLACE(LOWER(fts.name), '-', ' ') = ? THEN {self.exact_match_boost} ELSE 0.0 END)
+                (CASE WHEN {fts_name} = ? THEN {self.exact_match_boost} ELSE 0.0 END)
                 + (CASE WHEN {phrase_match_sql} THEN {self.phrase_match_boost} ELSE 0.0 END)
                 + (CASE WHEN {loose_match_sql} THEN {self.locale_prefix_boost} ELSE 0.0 END)
-                + (CASE WHEN REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || '%' AND fts.language_code IS NULL THEN {self.scientific_prefix_boost} ELSE 0.0 END)
-                + (CASE WHEN REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || '%' THEN {self.general_prefix_boost} ELSE 0.0 END)
+                + (CASE WHEN {fts_name} LIKE ? || '%' AND fts.language_code IS NULL THEN {self.scientific_prefix_boost} ELSE 0.0 END)
+                + (CASE WHEN {fts_name} LIKE ? || '%' THEN {self.general_prefix_boost} ELSE 0.0 END)
                 + (CASE WHEN fts.language_code LIKE ? THEN {self.english_lang_boost} ELSE 0.0 END)
                 + (LENGTH(fts.name) * {self.length_penalty_factor})
                 + (COALESCE(fts.count_rank, 0.0) * {self.popularity_rank_factor})
@@ -233,6 +243,7 @@ class TaxonAutocompleter:
     def __init__(self, db_path: PathOrStr = DB_PATH, limit: int = 10):
         self.connection = sqlite3.connect(db_path)
         self.connection.row_factory = sqlite3.Row
+        self.connection.create_function("strip_diacritics", 1, strip_diacritics)
         self.limit = limit
 
     def search(
@@ -257,17 +268,18 @@ class TaxonAutocompleter:
 
         params: list[Any] = []
 
+        fts_name = "REPLACE(LOWER(strip_diacritics(fts.name)), '-', ' ')"
         # 1. Phrase match parameters (added to params first)
         phrase_parts = [
-            "(REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || ' ' || '%' OR "
-            "REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || '-%' OR "
-            "REPLACE(LOWER(fts.name), '-', ' ') = ?)"
+            f"({fts_name} LIKE ? || ' ' || '%' OR "
+            f"{fts_name} LIKE ? || '-%' OR "
+            f"{fts_name} = ?)"
         ]
         phrase_params = [tokens[0], tokens[0], tokens[0]]
         for token in tokens[1:]:
             phrase_parts.append(
-                "(REPLACE(LOWER(fts.name), '-', ' ') LIKE '% ' || ? || ' ' || '%' OR "
-                "REPLACE(LOWER(fts.name), '-', ' ') LIKE '% ' || ? || '-%')"
+                f"({fts_name} LIKE '% ' || ? || ' ' || '%' OR "
+                f"{fts_name} LIKE '% ' || ? || '-%')"
             )
             phrase_params.extend([token, token])
 
@@ -275,12 +287,12 @@ class TaxonAutocompleter:
         phrase_match_sql += " AND fts.language_code IS NOT NULL"
 
         # 2. Loose prefix match parameters (added to params second)
-        loose_parts = ["REPLACE(LOWER(fts.name), '-', ' ') LIKE ? || '%'"]
+        loose_parts = [f"{fts_name} LIKE ? || '%'"]
         loose_params = [tokens[0]]
         for token in tokens[1:]:
             loose_parts.append(
-                "(REPLACE(LOWER(fts.name), '-', ' ') LIKE '% ' || ? || '%' OR "
-                "REPLACE(LOWER(fts.name), '-', ' ') LIKE '%-' || ? || '%')"
+                f"({fts_name} LIKE '% ' || ? || '%' OR "
+                f"{fts_name} LIKE '%-' || ? || '%')"
             )
             loose_params.extend([token, token])
 
