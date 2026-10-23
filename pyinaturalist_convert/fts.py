@@ -180,7 +180,6 @@ PHRASE_MATCH_BOOST = -10.0
 LOCALE_PREFIX_BOOST = -40.0
 SCIENTIFIC_PREFIX_BOOST = -30.0
 GENERAL_PREFIX_BOOST = -100.0
-LENGTH_PENALTY_FACTOR = 0.2
 ENGLISH_LANG_BOOST = -140.0
 POPULARITY_RANK_FACTOR = -10.0
 
@@ -199,7 +198,6 @@ class TaxonScoringStrategy:
     locale_prefix_boost: float = LOCALE_PREFIX_BOOST
     scientific_prefix_boost: float = SCIENTIFIC_PREFIX_BOOST
     general_prefix_boost: float = GENERAL_PREFIX_BOOST
-    length_penalty_factor: float = LENGTH_PENALTY_FACTOR
     english_lang_boost: float = ENGLISH_LANG_BOOST
     popularity_rank_factor: float = POPULARITY_RANK_FACTOR
 
@@ -219,7 +217,6 @@ class TaxonScoringStrategy:
                 + (CASE WHEN {fts_name} LIKE ? || '%' AND fts.language_code IS NULL THEN {self.scientific_prefix_boost} ELSE 0.0 END)
                 + (CASE WHEN {fts_name} LIKE ? || '%' THEN {self.general_prefix_boost} ELSE 0.0 END)
                 + (CASE WHEN fts.language_code LIKE ? THEN {self.english_lang_boost} ELSE 0.0 END)
-                + (LENGTH(fts.name) * {self.length_penalty_factor})
                 + (COALESCE(fts.count_rank, 0.0) * {self.popularity_rank_factor})
                 + fts.`rank`
             )
