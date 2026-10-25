@@ -175,12 +175,11 @@ class TextField(Enum):
     PLACE = 4
 
 # Named scoring constants for TaxonAutocompleter
-EXACT_MATCH_BOOST = -200.0
-PHRASE_MATCH_BOOST = -10.0
-LOCALE_PREFIX_BOOST = -40.0
-SCIENTIFIC_PREFIX_BOOST = -30.0
+EXACT_MATCH_BOOST = -300.0
+PHRASE_MATCH_BOOST = -245.0
+SCIENTIFIC_PREFIX_BOOST = -75.0
 GENERAL_PREFIX_BOOST = -100.0
-ENGLISH_LANG_BOOST = -140.0
+LOOSE_MATCH_BOOST = -240.0
 POPULARITY_RANK_FACTOR = -10.0
 
 def strip_diacritics(text: str) -> str:
@@ -195,38 +194,89 @@ def strip_diacritics(text: str) -> str:
 class TaxonScoringStrategy:
     exact_match_boost: float = EXACT_MATCH_BOOST
     phrase_match_boost: float = PHRASE_MATCH_BOOST
-    locale_prefix_boost: float = LOCALE_PREFIX_BOOST
     scientific_prefix_boost: float = SCIENTIFIC_PREFIX_BOOST
     general_prefix_boost: float = GENERAL_PREFIX_BOOST
-    english_lang_boost: float = ENGLISH_LANG_BOOST
+    loose_match_boost: float = LOOSE_MATCH_BOOST
     popularity_rank_factor: float = POPULARITY_RANK_FACTOR
 
     def build_scoring_sql(
         self,
         q_lower: str,
-        phrase_match_sql: str,
-        loose_match_sql: str,
-        preferred_lang: str,
+        tokens: list[str],
+        language: str,
     ) -> tuple[str, list[Any]]:
+        def build_phrase_match_sql(fts_name: str, tokens: list[str], language: str):
+            phrase_parts = [
+                f"({fts_name} LIKE ? || ' ' || '%' OR "
+                f"{fts_name} LIKE ? || '-%' OR "
+                f"{fts_name} = ?)"
+            ]
+            phrase_params = [tokens[0], tokens[0], tokens[0]]
+            for token in tokens[1:]:
+                phrase_parts.append(
+                    f"({fts_name} LIKE '% ' || ? || ' ' || '%' OR "
+                    f"{fts_name} LIKE '% ' || ? || '-%')"
+                )
+                phrase_params.extend([token, token])
+
+            phrase_match_sql = " AND ".join(phrase_parts)
+            if language:
+                phrase_match_sql += " AND fts.language_code LIKE ?"
+                phrase_params.append(language)
+            else:
+                phrase_match_sql += " AND fts.language_code is NULL"
+            return phrase_match_sql, phrase_params
+
+        def build_loose_match_sql(fts_name: str, tokens: list[str], language: str):
+            loose_parts = [f"{fts_name} LIKE ? || '%'"]
+            loose_params = [tokens[0]]
+            for token in tokens[1:]:
+                loose_parts.append(
+                    f"({fts_name} LIKE '% ' || ? || '%' OR "
+                    f"{fts_name} LIKE '%-' || ? || '%')"
+                )
+                loose_params.extend([token, token])
+
+            loose_match_sql = " AND ".join(loose_parts)
+            if language:
+                loose_match_sql += " AND fts.language_code LIKE ?"
+                loose_params.append(language)
+            else:
+                loose_match_sql += " AND fts.language_code IS NULL"
+            return loose_match_sql, loose_params
+
         fts_name = "REPLACE(LOWER(strip_diacritics(fts.name)), '-', ' ')"
+
+        # 1. Build locale phrase match SQL & params
+        phrase_match_sql, phrase_params = build_phrase_match_sql(fts_name, tokens, language)
+
+        # 2. Build locale loose match SQL & params
+        loose_match_sql, loose_params = build_loose_match_sql(fts_name, tokens, language)
+
         sql = f"""
             (
-                (CASE WHEN {fts_name} = ? THEN {self.exact_match_boost} ELSE 0.0 END)
-                + (CASE WHEN {phrase_match_sql} THEN {self.phrase_match_boost} ELSE 0.0 END)
-                + (CASE WHEN {loose_match_sql} THEN {self.locale_prefix_boost} ELSE 0.0 END)
-                + (CASE WHEN {fts_name} LIKE ? || '%' AND fts.language_code IS NULL THEN {self.scientific_prefix_boost} ELSE 0.0 END)
-                + (CASE WHEN {fts_name} LIKE ? || '%' THEN {self.general_prefix_boost} ELSE 0.0 END)
-                + (CASE WHEN fts.language_code LIKE ? THEN {self.english_lang_boost} ELSE 0.0 END)
+                CASE 
+                    WHEN {fts_name} = ? THEN {self.exact_match_boost}
+                    WHEN {fts_name} LIKE ? || '%' AND fts.language_code IS NULL THEN {self.scientific_prefix_boost}
+                    WHEN {phrase_match_sql} THEN {self.phrase_match_boost}
+                    WHEN {loose_match_sql} THEN {self.loose_match_boost}
+                    WHEN {fts_name} LIKE ? || '%' THEN {self.general_prefix_boost}
+                    ELSE 0.0
+                END
                 + (COALESCE(fts.count_rank, 0.0) * {self.popularity_rank_factor})
                 + fts.`rank`
             )
         """
+
+        # Order must match the '?' appearance sequence in the SQL string above:
         params = [
-            q_lower,
-            q_lower,
-            q_lower,
-            f"{preferred_lang}%",
+            q_lower,                       # Exact match
+            q_lower,                       # Scientific prefix match
+            *phrase_params,                # Locale phrase match
+            *loose_params,                 # Locale loose match
+            q_lower,                       # General prefix match
         ]
+
         return sql, params
 
 class TaxonAutocompleter:
@@ -265,47 +315,13 @@ class TaxonAutocompleter:
 
         params: list[Any] = []
 
-        fts_name = "REPLACE(LOWER(strip_diacritics(fts.name)), '-', ' ')"
-        # 1. Phrase match parameters (added to params first)
-        phrase_parts = [
-            f"({fts_name} LIKE ? || ' ' || '%' OR "
-            f"{fts_name} LIKE ? || '-%' OR "
-            f"{fts_name} = ?)"
-        ]
-        phrase_params = [tokens[0], tokens[0], tokens[0]]
-        for token in tokens[1:]:
-            phrase_parts.append(
-                f"({fts_name} LIKE '% ' || ? || ' ' || '%' OR "
-                f"{fts_name} LIKE '% ' || ? || '-%')"
-            )
-            phrase_params.extend([token, token])
-
-        phrase_match_sql = " AND ".join(phrase_parts)
-        phrase_match_sql += " AND fts.language_code IS NOT NULL"
-
-        # 2. Loose prefix match parameters (added to params second)
-        loose_parts = [f"{fts_name} LIKE ? || '%'"]
-        loose_params = [tokens[0]]
-        for token in tokens[1:]:
-            loose_parts.append(
-                f"({fts_name} LIKE '% ' || ? || '%' OR "
-                f"{fts_name} LIKE '%-' || ? || '%')"
-            )
-            loose_params.extend([token, token])
-
-        loose_match_sql = " AND ".join(loose_parts)
-        loose_match_sql += " AND fts.language_code IS NOT NULL"
-
-        # 3. Get scoring SQL and its corresponding parameters from the strategy object
+        # 3. Get scoring SQL, passing the fragments and their params down so they bind in sequence
         score_sql, strategy_params = strategy.build_scoring_sql(
             q_lower=q_lower,
-            phrase_match_sql=phrase_match_sql,
-            loose_match_sql=loose_match_sql,
-            preferred_lang=preferred_lang,
+            tokens=tokens,
+            language=preferred_lang,
         )
         params.extend(strategy_params)
-        params.extend(phrase_params)
-        params.extend(loose_params)
 
         # 4. WHERE & JOIN clauses
         where_clauses = ["fts.name MATCH ?"]
@@ -366,6 +382,7 @@ class TaxonAutocompleter:
             query += " LIMIT ?"
             params.append(self.limit)
 
+        #print(query)
         with self.connection as conn:
             cursor = conn.execute(query, params)
             results = cursor.fetchall()
