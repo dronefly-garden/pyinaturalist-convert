@@ -175,12 +175,12 @@ class TextField(Enum):
     PLACE = 4
 
 # Named scoring constants for TaxonAutocompleter
-EXACT_MATCH_BOOST = -300.0
+EXACT_MATCH_BOOST = -500.0
 PHRASE_MATCH_BOOST = -245.0
 SCIENTIFIC_PREFIX_BOOST = -75.0
 GENERAL_PREFIX_BOOST = -100.0
 LOOSE_MATCH_BOOST = -240.0
-POPULARITY_RANK_FACTOR = -10.0
+POPULARITY_RANK_FACTOR = -8.0
 
 def strip_diacritics(text: str) -> str:
     if not text:
