@@ -175,12 +175,14 @@ class TextField(Enum):
     PLACE = 4
 
 # Named scoring constants for TaxonAutocompleter
-EXACT_MATCH_BOOST = -500.0
-PHRASE_MATCH_BOOST = -245.0
-SCIENTIFIC_PREFIX_BOOST = -75.0
-GENERAL_PREFIX_BOOST = -100.0
-LOOSE_MATCH_BOOST = -240.0
-POPULARITY_RANK_FACTOR = -8.0
+EXACT_MATCH_BOOST = -10000.0
+SCI_PHRASE_MATCH_BOOST = -300.0
+SCI_LOOSE_MATCH_BOOST = -240.0
+LOC_PHRASE_MATCH_BOOST = -280.0
+LOC_LOOSE_MATCH_BOOST = -270.0
+PHRASE_MATCH_BOOST = -20.0
+LOOSE_MATCH_BOOST = -10.0
+POPULARITY_RANK_FACTOR = -15.0
 
 def strip_diacritics(text: str) -> str:
     if not text:
@@ -193,9 +195,12 @@ def strip_diacritics(text: str) -> str:
 @dataclass
 class TaxonScoringStrategy:
     exact_match_boost: float = EXACT_MATCH_BOOST
+    sci_prefix_boost: float = SCI_PHRASE_MATCH_BOOST
+    sci_phrase_match_boost: float = SCI_PHRASE_MATCH_BOOST
+    sci_loose_match_boost: float = SCI_LOOSE_MATCH_BOOST
+    loc_phrase_match_boost: float = LOC_PHRASE_MATCH_BOOST
+    loc_loose_match_boost: float = LOC_LOOSE_MATCH_BOOST
     phrase_match_boost: float = PHRASE_MATCH_BOOST
-    scientific_prefix_boost: float = SCIENTIFIC_PREFIX_BOOST
-    general_prefix_boost: float = GENERAL_PREFIX_BOOST
     loose_match_boost: float = LOOSE_MATCH_BOOST
     popularity_rank_factor: float = POPULARITY_RANK_FACTOR
 
@@ -220,11 +225,11 @@ class TaxonScoringStrategy:
                 phrase_params.extend([token, token])
 
             phrase_match_sql = " AND ".join(phrase_parts)
-            if language:
+            if language == 'sci':
+                phrase_match_sql += " AND fts.language_code is NULL"
+            elif language:
                 phrase_match_sql += " AND fts.language_code LIKE ?"
                 phrase_params.append(language)
-            else:
-                phrase_match_sql += " AND fts.language_code is NULL"
             return phrase_match_sql, phrase_params
 
         def build_loose_match_sql(fts_name: str, tokens: list[str], language: str):
@@ -238,29 +243,43 @@ class TaxonScoringStrategy:
                 loose_params.extend([token, token])
 
             loose_match_sql = " AND ".join(loose_parts)
-            if language:
+            if language == 'sci':
+                loose_match_sql += " AND fts.language_code is NULL"
+            elif language:
                 loose_match_sql += " AND fts.language_code LIKE ?"
                 loose_params.append(language)
-            else:
-                loose_match_sql += " AND fts.language_code IS NULL"
             return loose_match_sql, loose_params
 
         fts_name = "REPLACE(LOWER(strip_diacritics(fts.name)), '-', ' ')"
 
-        # 1. Build locale phrase match SQL & params
-        phrase_match_sql, phrase_params = build_phrase_match_sql(fts_name, tokens, language)
+        # 1. Build scientific name phrase match SQL & params
+        sci_phrase_match_sql, sci_phrase_params = build_phrase_match_sql(fts_name, tokens, 'sci')
 
-        # 2. Build locale loose match SQL & params
-        loose_match_sql, loose_params = build_loose_match_sql(fts_name, tokens, language)
+        # 2. Build scientific name loose match SQL & params
+        sci_loose_match_sql, sci_loose_params = build_loose_match_sql(fts_name, tokens, 'sci')
+
+        # 3. Build locale phrase match SQL & params
+        loc_phrase_match_sql, loc_phrase_params = build_phrase_match_sql(fts_name, tokens, language)
+
+        # 4. Build locale loose match SQL & params
+        loc_loose_match_sql, loc_loose_params = build_loose_match_sql(fts_name, tokens, language)
+
+        # 5. Build general phrase match SQL & params
+        phrase_match_sql, phrase_params = build_phrase_match_sql(fts_name, tokens, None)
+
+        # 6. Build general loose match SQL & params
+        loose_match_sql, loose_params = build_loose_match_sql(fts_name, tokens, None)
 
         sql = f"""
             (
                 CASE 
                     WHEN {fts_name} = ? THEN {self.exact_match_boost}
-                    WHEN {fts_name} LIKE ? || '%' AND fts.language_code IS NULL THEN {self.scientific_prefix_boost}
+                    WHEN {sci_phrase_match_sql} THEN {self.sci_phrase_match_boost}
+                    WHEN {sci_loose_match_sql} THEN {self.sci_loose_match_boost}
+                    WHEN {loc_phrase_match_sql} THEN {self.loc_phrase_match_boost}
+                    WHEN {loc_loose_match_sql} THEN {self.loc_loose_match_boost}
                     WHEN {phrase_match_sql} THEN {self.phrase_match_boost}
                     WHEN {loose_match_sql} THEN {self.loose_match_boost}
-                    WHEN {fts_name} LIKE ? || '%' THEN {self.general_prefix_boost}
                     ELSE 0.0
                 END
                 + (COALESCE(fts.count_rank, 0.0) * {self.popularity_rank_factor})
@@ -271,10 +290,12 @@ class TaxonScoringStrategy:
         # Order must match the '?' appearance sequence in the SQL string above:
         params = [
             q_lower,                       # Exact match
-            q_lower,                       # Scientific prefix match
-            *phrase_params,                # Locale phrase match
-            *loose_params,                 # Locale loose match
-            q_lower,                       # General prefix match
+            *sci_phrase_params,            # Scientific name phrase match
+            *sci_loose_params,             # Scientific name loose match
+            *loc_phrase_params,            # Locale phrase match
+            *loc_loose_params,             # Locale loose match
+            *phrase_params,                # General phrase match
+            *loose_params,                 # General loose match
         ]
 
         return sql, params
