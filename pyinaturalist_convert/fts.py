@@ -225,10 +225,11 @@ class TaxonScoringStrategy:
                 phrase_params.extend([token, token])
 
             phrase_match_sql = " AND ".join(phrase_parts)
+            # Use column name directly without table alias
             if language == 'sci':
-                phrase_match_sql += " AND fts.language_code is NULL"
+                phrase_match_sql += " AND language_code is NULL"
             elif language:
-                phrase_match_sql += " AND fts.language_code LIKE ?"
+                phrase_match_sql += " AND language_code LIKE ?"
                 phrase_params.append(language)
             return phrase_match_sql, phrase_params
 
@@ -243,60 +244,69 @@ class TaxonScoringStrategy:
                 loose_params.extend([token, token])
 
             loose_match_sql = " AND ".join(loose_parts)
+            # Use column name directly without table alias
             if language == 'sci':
-                loose_match_sql += " AND fts.language_code is NULL"
+                loose_match_sql += " AND language_code is NULL"
             elif language:
-                loose_match_sql += " AND fts.language_code LIKE ?"
+                loose_match_sql += " AND language_code LIKE ?"
                 loose_params.append(language)
             return loose_match_sql, loose_params
 
-        fts_name = "REPLACE(LOWER(strip_diacritics(fts.name)), '-', ' ')"
+        fts_name = "clean_name"
 
-        # 1. Build scientific name phrase match SQL & params
-        sci_phrase_match_sql, sci_phrase_params = build_phrase_match_sql(fts_name, tokens, 'sci')
+        if len(tokens) > 1:
+            # Generate base phrase and loose match SQL *without* language filters
+            phrase_sql, phrase_params = build_phrase_match_sql(fts_name, tokens, None)
+            loose_sql, loose_params = build_loose_match_sql(fts_name, tokens, None)
 
-        # 2. Build scientific name loose match SQL & params
-        sci_loose_match_sql, sci_loose_params = build_loose_match_sql(fts_name, tokens, 'sci')
-
-        # 3. Build locale phrase match SQL & params
-        loc_phrase_match_sql, loc_phrase_params = build_phrase_match_sql(fts_name, tokens, language)
-
-        # 4. Build locale loose match SQL & params
-        loc_loose_match_sql, loc_loose_params = build_loose_match_sql(fts_name, tokens, language)
-
-        # 5. Build general phrase match SQL & params
-        phrase_match_sql, phrase_params = build_phrase_match_sql(fts_name, tokens, None)
-
-        # 6. Build general loose match SQL & params
-        loose_match_sql, loose_params = build_loose_match_sql(fts_name, tokens, None)
-
-        sql = f"""
-            (
-                CASE 
-                    WHEN {fts_name} = ? THEN {self.exact_match_boost}
-                    WHEN {sci_phrase_match_sql} THEN {self.sci_phrase_match_boost}
-                    WHEN {sci_loose_match_sql} THEN {self.sci_loose_match_boost}
-                    WHEN {loc_phrase_match_sql} THEN {self.loc_phrase_match_boost}
-                    WHEN {loc_loose_match_sql} THEN {self.loc_loose_match_boost}
-                    WHEN {phrase_match_sql} THEN {self.phrase_match_boost}
-                    WHEN {loose_match_sql} THEN {self.loose_match_boost}
-                    ELSE 0.0
-                END
-                + (COALESCE(fts.count_rank, 0.0) * {self.popularity_rank_factor})
-                + fts.`rank`
-            )
-        """
-
-        # Order must match the '?' appearance sequence in the SQL string above:
-        params = [
-            q_lower,                       # Exact match
-            *sci_phrase_params,            # Scientific name phrase match
-            *sci_loose_params,             # Scientific name loose match
-            *loc_phrase_params,            # Locale phrase match
-            *loc_loose_params,             # Locale loose match
-            *phrase_params,                # General phrase match
-            *loose_params,                 # General loose match
-        ]
+            sql = f"""
+                (
+                    CASE 
+                        WHEN {fts_name} = ? THEN {self.exact_match_boost}
+                        WHEN {phrase_sql} THEN
+                            CASE 
+                                WHEN language_code IS NULL THEN {self.sci_phrase_match_boost}
+                                WHEN language_code LIKE ? THEN {self.loc_phrase_match_boost}
+                                ELSE {self.phrase_match_boost}
+                            END
+                        WHEN {loose_sql} THEN
+                            CASE 
+                                WHEN language_code IS NULL THEN {self.sci_loose_match_boost}
+                                WHEN language_code LIKE ? THEN {self.loc_loose_match_boost}
+                                ELSE {self.loose_match_boost}
+                            END
+                        ELSE 0.0
+                    END
+                    + (COALESCE(count_rank, 0.0) * {self.popularity_rank_factor})
+                    + `rank`
+                )
+            """
+            # Sequence: exact match, phrase params, phrase language, loose params, loose language
+            params = [
+                q_lower,
+                *phrase_params,
+                language,
+                *loose_params,
+                language,
+            ]
+        else:
+            sql = f"""
+                (
+                    CASE 
+                        WHEN {fts_name} = ? THEN {self.exact_match_boost}
+                        WHEN {fts_name} LIKE ? || '%' THEN
+                            CASE 
+                                WHEN language_code IS NULL THEN {self.sci_loose_match_boost}
+                                WHEN language_code LIKE ? THEN {self.loc_loose_match_boost}
+                                ELSE {self.loose_match_boost}
+                            END
+                        ELSE 0.0
+                    END
+                    + (COALESCE(count_rank, 0.0) * {self.popularity_rank_factor})
+                    + `rank`
+                )
+            """
+            params = [q_lower, q_lower, language]
 
         return sql, params
 
@@ -336,15 +346,7 @@ class TaxonAutocompleter:
 
         params: list[Any] = []
 
-        # 3. Get scoring SQL, passing the fragments and their params down so they bind in sequence
-        score_sql, strategy_params = strategy.build_scoring_sql(
-            q_lower=q_lower,
-            tokens=tokens,
-            language=preferred_lang,
-        )
-        params.extend(strategy_params)
-
-        # 4. WHERE & JOIN clauses
+        # 3. WHERE & JOIN clauses
         where_clauses = ["fts.name MATCH ?"]
         params.append(fts_q)
 
@@ -364,18 +366,37 @@ class TaxonAutocompleter:
 
         where_sql = " AND ".join(where_clauses)
 
+        # 4. Get scoring SQL, passing the fragments and their params down so they bind in sequence
+        score_sql, strategy_params = strategy.build_scoring_sql(
+            q_lower=q_lower,
+            tokens=tokens,
+            language=preferred_lang,
+        )
+        params.extend(strategy_params)
+
         query = f"""
-            WITH scored AS (
+            WITH base AS (
                 SELECT 
                     fts.taxon_id,
                     fts.name,
                     fts.taxon_rank,
                     fts.count_rank,
                     fts.language_code,
-                    {score_sql} AS item_score
+                    fts.`rank`,
+                    REPLACE(LOWER(strip_diacritics(fts.name)), '-', ' ') AS clean_name
                 FROM {TAXON_FTS_TABLE} fts
                 {join_sql}
                 WHERE {where_sql}
+            ),
+            scored AS (
+                SELECT 
+                    taxon_id,
+                    name,
+                    taxon_rank,
+                    count_rank,
+                    language_code,
+                    {score_sql} AS item_score
+                FROM base
             ),
             ranked AS (
                 SELECT 
@@ -403,7 +424,6 @@ class TaxonAutocompleter:
             query += " LIMIT ?"
             params.append(self.limit)
 
-        #print(query)
         with self.connection as conn:
             cursor = conn.execute(query, params)
             results = cursor.fetchall()
