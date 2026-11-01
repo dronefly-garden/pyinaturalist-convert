@@ -319,7 +319,7 @@ class TaxonAutocompleter:
     """
 
     def __init__(self, db_path: PathOrStr = DB_PATH, limit: int = 10):
-        self.connection = sqlite3.connect(db_path)
+        self.connection = sqlite3.connect(db_path, check_same_thread=False)
         self.connection.row_factory = sqlite3.Row
         self.connection.create_function("strip_diacritics", 1, strip_diacritics)
         self.limit = limit
