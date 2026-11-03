@@ -210,59 +210,44 @@ class TaxonScoringStrategy:
         tokens: list[str],
         language: str,
     ) -> tuple[str, list[Any]]:
-        def build_phrase_match_sql(fts_name: str, tokens: list[str], language: str):
+        def build_phrase_match_sql(tokens: list[str]):
             phrase_parts = [
-                f"({fts_name} LIKE ? || ' ' || '%' OR "
-                f"{fts_name} LIKE ? || '-%' OR "
-                f"{fts_name} = ?)"
+                f"(clean_name LIKE ? || ' ' || '%' OR "
+                f"clean_name LIKE ? || '-%' OR "
+                f"clean_name = ?)"
             ]
             phrase_params = [tokens[0], tokens[0], tokens[0]]
             for token in tokens[1:]:
                 phrase_parts.append(
-                    f"({fts_name} LIKE '% ' || ? || ' ' || '%' OR "
-                    f"{fts_name} LIKE '% ' || ? || '-%')"
+                    f"(clean_name LIKE '% ' || ? || ' ' || '%' OR "
+                    f"clean_name LIKE '% ' || ? || '-%')"
                 )
                 phrase_params.extend([token, token])
 
             phrase_match_sql = " AND ".join(phrase_parts)
-            # Use column name directly without table alias
-            if language == 'sci':
-                phrase_match_sql += " AND language_code is NULL"
-            elif language:
-                phrase_match_sql += " AND language_code LIKE ?"
-                phrase_params.append(language)
             return phrase_match_sql, phrase_params
 
-        def build_loose_match_sql(fts_name: str, tokens: list[str], language: str):
-            loose_parts = [f"{fts_name} LIKE ? || '%'"]
+        def build_loose_match_sql(tokens: list[str]):
+            loose_parts = [f"clean_name LIKE ? || '%'"]
             loose_params = [tokens[0]]
             for token in tokens[1:]:
                 loose_parts.append(
-                    f"({fts_name} LIKE '% ' || ? || '%' OR "
-                    f"{fts_name} LIKE '%-' || ? || '%')"
+                    f"(clean_name LIKE '% ' || ? || '%' OR "
+                    f"clean_name LIKE '%-' || ? || '%')"
                 )
                 loose_params.extend([token, token])
 
             loose_match_sql = " AND ".join(loose_parts)
-            # Use column name directly without table alias
-            if language == 'sci':
-                loose_match_sql += " AND language_code is NULL"
-            elif language:
-                loose_match_sql += " AND language_code LIKE ?"
-                loose_params.append(language)
             return loose_match_sql, loose_params
 
-        fts_name = "clean_name"
-
         if len(tokens) > 1:
-            # Generate base phrase and loose match SQL *without* language filters
-            phrase_sql, phrase_params = build_phrase_match_sql(fts_name, tokens, None)
-            loose_sql, loose_params = build_loose_match_sql(fts_name, tokens, None)
+            phrase_sql, phrase_params = build_phrase_match_sql(tokens)
+            loose_sql, loose_params = build_loose_match_sql(tokens)
 
             sql = f"""
                 (
                     CASE 
-                        WHEN {fts_name} = ? THEN {self.exact_match_boost}
+                        WHEN clean_name = ? THEN {self.exact_match_boost}
                         WHEN {phrase_sql} THEN
                             CASE 
                                 WHEN language_code IS NULL THEN {self.sci_phrase_match_boost}
@@ -281,7 +266,6 @@ class TaxonScoringStrategy:
                     + `rank`
                 )
             """
-            # Sequence: exact match, phrase params, phrase language, loose params, loose language
             params = [
                 q_lower,
                 *phrase_params,
@@ -293,8 +277,8 @@ class TaxonScoringStrategy:
             sql = f"""
                 (
                     CASE 
-                        WHEN {fts_name} = ? THEN {self.exact_match_boost}
-                        WHEN {fts_name} LIKE ? || '%' THEN
+                        WHEN clean_name = ? THEN {self.exact_match_boost}
+                        WHEN clean_name LIKE ? || '%' THEN
                             CASE 
                                 WHEN language_code IS NULL THEN {self.sci_loose_match_boost}
                                 WHEN language_code LIKE ? THEN {self.loc_loose_match_boost}
@@ -332,6 +316,8 @@ class TaxonAutocompleter:
         taxon_id: int | None = None,
         strategy: TaxonScoringStrategy | None = None,
     ) -> list[Taxon]:
+        params: list[Any] = []
+
         if strategy is None:
             strategy = TaxonScoringStrategy()
 
@@ -344,9 +330,6 @@ class TaxonAutocompleter:
         q_lower = clean_q.lower()
         preferred_lang = language.lower().replace('-', '_')[:2] if language else 'en'
 
-        params: list[Any] = []
-
-        # 3. WHERE & JOIN clauses
         where_clauses = ["fts.name MATCH ?"]
         params.append(fts_q)
 
@@ -366,7 +349,6 @@ class TaxonAutocompleter:
 
         where_sql = " AND ".join(where_clauses)
 
-        # 4. Get scoring SQL, passing the fragments and their params down so they bind in sequence
         score_sql, strategy_params = strategy.build_scoring_sql(
             q_lower=q_lower,
             tokens=tokens,
